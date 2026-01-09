@@ -1,9 +1,10 @@
-# main.py
 import argparse
 import torch
 import matplotlib.pyplot as plt
-from tqdm import tqdm   # ⭐ 新增
-from dataloader import load_images_and_labels
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from dataloader import DefectDataset
 from model import CNN
 from utils import compute_metrics
 
@@ -13,20 +14,37 @@ def main():
     # Parse arguments
     # -------------------------------
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_data_path', type=str, default='train')
-    parser.add_argument('--val_data_path', type=str, default='val')
+    parser.add_argument('--train_data_path', type=str, required=True)
+    parser.add_argument('--val_data_path', type=str, required=True)
     args = parser.parse_args()
 
     # -------------------------------
     # Set device
     # -------------------------------
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("Using device:", device)
 
     # -------------------------------
-    # Load data
+    # Load dataset & dataloader
     # -------------------------------
-    train_data = load_images_and_labels(args.train_data_path, device)
-    val_data = load_images_and_labels(args.val_data_path, device)
+    train_dataset = DefectDataset(args.train_data_path, augment=True)
+    val_dataset = DefectDataset(args.val_data_path, augment=False)
+
+    batch_size = 128
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
 
     # -------------------------------
     # Initialize model
@@ -36,11 +54,11 @@ def main():
     # -------------------------------
     # Hyperparameters
     # -------------------------------
-    num_epochs = 5
-    lr = 0.001
+    num_epochs = 20
+    lr = 1e-3
 
     # -------------------------------
-    # Metric storage
+    # Metric storage (for plotting)
     # -------------------------------
     train_losses, train_accs = [], []
     val_precisions, val_recalls, val_f1s = [], [], []
@@ -51,6 +69,7 @@ def main():
     with open('score.txt', 'w') as f:
         f.write("Model Hyperparameters:\n")
         f.write(f"Learning rate: {lr}\n")
+        f.write(f"Batch size: {batch_size}\n")
         f.write(f"Number of epochs: {num_epochs}\n\n")
         f.write("Training process:\n")
 
@@ -58,54 +77,66 @@ def main():
         # Training loop
         # -------------------------------
         for epoch in range(num_epochs):
-            total_loss = 0.0
+            model_loss = 0.0
             correct = 0
+            total = 0
 
-            # ⭐ tqdm 进度条（核心）
-            for img, label in tqdm(
-                train_data,
+            pbar = tqdm(
+                train_loader,
                 desc=f"Epoch {epoch+1}/{num_epochs}",
-                unit="img",
-                leave=False
-            ):
-                output = model.forward(img)
-                prob = output.clamp(1e-6, 1 - 1e-6)
-                y_tensor = torch.tensor(label, device=device, dtype=torch.float32)
+                unit="batch"
+            )
 
-                loss = -(y_tensor * torch.log(prob) + (1 - y_tensor) * torch.log(1 - prob))
-                total_loss += loss.item()
+            for xb, yb in pbar:
+                xb = xb.to(device)
+                yb = yb.to(device)
 
-                pred_label = 1 if output.item() >= 0.5 else 0
-                if pred_label == label:
-                    correct += 1
+                # Forward
+                out = model.forward(xb)
 
-                model.backward(label, lr)
+                # BCE loss (mean)
+                loss = -(yb * torch.log(out + 1e-6) +
+                         (1 - yb) * torch.log(1 - out + 1e-6)).mean()
 
-            # Training metrics
-            avg_loss = total_loss / len(train_data)
-            accuracy = correct / len(train_data)
+                # Backward (manual)
+                model.backward(yb, lr)
+
+                # Statistics
+                batch_size_now = yb.size(0)
+                model_loss += loss.item() * batch_size_now
+                preds = (out >= 0.5).float()
+                correct += (preds == yb).sum().item()
+                total += batch_size_now
+
+                pbar.set_postfix(loss=loss.item())
+
+            avg_loss = model_loss / total
+            accuracy = correct / total
             train_losses.append(avg_loss)
             train_accs.append(accuracy)
 
             # -------------------------------
             # Validation
             # -------------------------------
-            y_true_val, y_pred_val = [], []
+            y_true, y_pred = [], []
             with torch.no_grad():
-                for img, label in val_data:
-                    output = model.forward(img)
-                    pred_label = 1 if output.item() >= 0.5 else 0
-                    y_true_val.append(label)
-                    y_pred_val.append(pred_label)
+                for xb, yb in val_loader:
+                    xb = xb.to(device)
+                    out = model.forward(xb)
+                    preds = (out >= 0.5).int().cpu().tolist()
+                    y_pred.extend(preds)
+                    y_true.extend(yb.int().tolist())
 
-            precision, recall, f1 = compute_metrics(y_true_val, y_pred_val)
+            precision, recall, f1 = compute_metrics(y_true, y_pred)
             val_precisions.append(precision)
             val_recalls.append(recall)
             val_f1s.append(f1)
 
             log_line = (
-                f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Accuracy={accuracy:.4f}, "
-                f"Val Precision={precision:.4f}, Val Recall={recall:.4f}, Val F1={f1:.4f}\n"
+                f"Epoch {epoch+1}: "
+                f"Loss={avg_loss:.4f}, Acc={accuracy:.4f}, "
+                f"Val Precision={precision:.4f}, "
+                f"Val Recall={recall:.4f}, Val F1={f1:.4f}\n"
             )
             print(log_line, end='')
             f.write(log_line)
@@ -146,3 +177,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

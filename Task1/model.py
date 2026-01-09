@@ -1,137 +1,122 @@
 import torch
 import torch.nn.functional as F
 
-
 class CNN:
-    """
-    Shallow CNN for binary classification (Task 1)
-    Architecture:
-        Conv(1→4) → ReLU →
-        Conv(4→8) → ReLU →
-        Flatten → FC → Sigmoid
-
-    All gradients are manually derived.
-    No autograd is used.
-    """
-
     def __init__(self, device):
         self.device = device
+        
+        # 为了适配你的 main.py，必须使用这些变量名
+        # 虽然我们有6层卷积，但 main.py 可能只存取部分。
+        # 我们将主要权重命名为 conv1, conv2, fc，其余作为辅助。
 
-        # ---------- Conv layer 1 ----------
-        self.conv1_weight = torch.randn(4, 1, 3, 3, device=device) * 0.01
-        self.conv1_bias = torch.zeros(4, device=device)
+        def init_w(out_c, in_c, k):
+            return torch.randn(out_c, in_c, k, k, device=device) * (2. / (in_c * k * k))**0.5
 
-        # ---------- Conv layer 2 ----------
-        self.conv2_weight = torch.randn(8, 4, 3, 3, device=device) * 0.01
-        self.conv2_bias = torch.zeros(8, device=device)
+        # --- Block 1 ---
+        self.conv1_weight = init_w(16, 1, 3) # 改回原名
+        self.conv1_bias = torch.zeros(16, device=device)
+        self.c2_w = init_w(16, 16, 3)
+        self.c2_b = torch.zeros(16, device=device)
 
-        # Input: 224×224
-        # conv1 → 222×222
-        # conv2 → 220×220
-        self.fc_in_dim = 8 * 220 * 220
+        # --- Block 2 ---
+        self.conv2_weight = init_w(32, 16, 3) # 改回原名
+        self.conv2_bias = torch.zeros(32, device=device)
+        self.c4_w = init_w(32, 32, 3)
+        self.c4_b = torch.zeros(32, device=device)
 
-        # ---------- Fully connected ----------
-        self.fc_weight = torch.randn(self.fc_in_dim, device=device) * 0.01
+        # --- Block 3 ---
+        self.c5_w = init_w(64, 32, 3)
+        self.c5_b = torch.zeros(64, device=device)
+        self.c6_w = init_w(64, 64, 3)
+        self.c6_b = torch.zeros(64, device=device)
+
+        # --- FC ---
+        self.flat_dim = 64 * 28 * 28
+        self.fc_weight = torch.randn(self.flat_dim, 1, device=device) * 0.01 # 改回原名
         self.fc_bias = torch.zeros(1, device=device)
 
-    # ============================================================
-    # Forward
-    # ============================================================
     def forward(self, x):
-        """
-        x: [1, 224, 224] grayscale image
-        return: scalar sigmoid output
-        """
-        x = x.unsqueeze(0)  # [1,1,224,224]
-
-        # Conv1 + ReLU
-        self.conv1 = F.conv2d(x, self.conv1_weight, self.conv1_bias)
-        self.relu1 = torch.clamp(self.conv1, min=0)
-
-        # Conv2 + ReLU
-        self.conv2 = F.conv2d(self.relu1, self.conv2_weight, self.conv2_bias)
-        self.relu2 = torch.clamp(self.conv2, min=0)
-
-        # Flatten
-        self.flat = self.relu2.view(-1)
-
-        # FC + Sigmoid
-        self.fc_out = self.flat.matmul(self.fc_weight) + self.fc_bias
-        self.output = torch.sigmoid(self.fc_out)
-
         self.x = x
-        return self.output
+        # Block 1
+        self.z1 = F.conv2d(x, self.conv1_weight, self.conv1_bias, padding=1)
+        self.a1 = F.relu(self.z1)
+        self.z2 = F.conv2d(self.a1, self.c2_w, self.c2_b, padding=1)
+        self.a2 = F.relu(self.z2)
+        self.p1, self.idx1 = F.max_pool2d(self.a2, 2, return_indices=True)
 
-    # ============================================================
-    # Backward (manual)
-    # ============================================================
-    def backward(self, label, lr):
-        """
-        label: 0 or 1
-        lr: learning rate
-        """
-        y = torch.tensor(label, device=self.device, dtype=torch.float32)
-        out = self.output.squeeze()
+        # Block 2
+        self.z3 = F.conv2d(self.p1, self.conv2_weight, self.conv2_bias, padding=1)
+        self.a3 = F.relu(self.z3)
+        self.z4 = F.conv2d(self.a3, self.c4_w, self.c4_b, padding=1)
+        self.a4 = F.relu(self.z4)
+        self.p2, self.idx2 = F.max_pool2d(self.a4, 2, return_indices=True)
 
-        # --------------------------------------------------------
-        # BCE + Sigmoid gradient
-        # dL/dz = (σ(z) - y)
-        # --------------------------------------------------------
-        grad_fc_out = out - y  # scalar
+        # Block 3
+        self.z5 = F.conv2d(self.p2, self.c5_w, self.c5_b, padding=1)
+        self.a5 = F.relu(self.z5)
+        self.z6 = F.conv2d(self.a5, self.c6_w, self.c6_b, padding=1)
+        self.a6 = F.relu(self.z6)
+        self.p3, self.idx3 = F.max_pool2d(self.a6, 2, return_indices=True)
 
-        # ---------- FC gradients ----------
-        grad_fc_bias = grad_fc_out
-        grad_fc_weight = grad_fc_out * self.flat
+        self.flat = self.p3.view(x.shape[0], -1)
+        self.z_fc = self.flat.matmul(self.fc_weight) + self.fc_bias
+        self.out = torch.sigmoid(self.z_fc).squeeze(1)
+        return self.out
 
-        grad_flat = grad_fc_out * self.fc_weight
-        grad_relu2 = grad_flat.view(1, 8, 220, 220)
+    def backward(self, y, lr):
+        B = y.shape[0]
+        y = y.view(-1, 1)
+        out = self.out.view(-1, 1)
 
-        # --------------------------------------------------------
-        # ReLU2 backward
-        # --------------------------------------------------------
-        grad_conv2 = grad_relu2.clone()
-        grad_conv2[self.conv2 <= 0] = 0
+        # 稍微调低 pos_weight (从4.0降到2.5)，平衡 Precision 和 Recall
+        pos_weight = 2.5 
+        weights = torch.where(y == 1, torch.tensor(pos_weight, device=self.device), torch.tensor(1.0, device=self.device))
+        dz_fc = (out - y) * weights
 
-        # ---------- Conv2 gradients ----------
-        grad_conv2_weight = torch.zeros_like(self.conv2_weight)
-        grad_conv2_bias = torch.zeros_like(self.conv2_bias)
+        dw_fc = self.flat.t().matmul(dz_fc) / B
+        db_fc = dz_fc.mean(dim=0)
+        d_p3 = dz_fc.matmul(self.fc_weight.t()).view(self.p3.shape)
 
-        for oc in range(8):
-            grad_conv2_bias[oc] = grad_conv2[0, oc].sum()
-            for ic in range(4):
-                grad_conv2_weight[oc, ic] = F.conv2d(
-                    self.relu1[:, ic:ic+1],
-                    grad_conv2[:, oc:oc+1]
-                ).squeeze()
+        # Block 3 Back
+        d_a6 = F.max_unpool2d(d_p3, self.idx3, 2, output_size=self.a6.shape)
+        d_z6 = d_a6 * (self.z6 > 0).float()
+        dw6 = F.conv2d(self.a5.transpose(0,1), d_z6.transpose(0,1), padding=1).transpose(0,1) / B
+        db6 = d_z6.sum(dim=(0,2,3)) / B
+        d_a5 = F.conv_transpose2d(d_z6, self.c6_w, padding=1)
 
-        # ---------- Propagate to conv1 ----------
-        grad_relu1 = F.conv_transpose2d(grad_conv2, self.conv2_weight)
+        d_z5 = d_a5 * (self.z5 > 0).float()
+        dw5 = F.conv2d(self.p2.transpose(0,1), d_z5.transpose(0,1), padding=1).transpose(0,1) / B
+        db5 = d_z5.sum(dim=(0,2,3)) / B
+        d_p2 = F.conv_transpose2d(d_z5, self.c5_w, padding=1)
 
-        # --------------------------------------------------------
-        # ReLU1 backward
-        # --------------------------------------------------------
-        grad_conv1 = grad_relu1.clone()
-        grad_conv1[self.conv1 <= 0] = 0
+        # Block 2 Back
+        d_a4 = F.max_unpool2d(d_p2, self.idx2, 2, output_size=self.a4.shape)
+        d_z4 = d_a4 * (self.z4 > 0).float()
+        dw4 = F.conv2d(self.a3.transpose(0,1), d_z4.transpose(0,1), padding=1).transpose(0,1) / B
+        db4 = d_z4.sum(dim=(0,2,3)) / B
+        d_a3 = F.conv_transpose2d(d_z4, self.c4_w, padding=1)
 
-        # ---------- Conv1 gradients ----------
-        grad_conv1_weight = torch.zeros_like(self.conv1_weight)
-        grad_conv1_bias = torch.zeros_like(self.conv1_bias)
+        d_z3 = d_a3 * (self.z3 > 0).float()
+        dw3 = F.conv2d(self.p1.transpose(0,1), d_z3.transpose(0,1), padding=1).transpose(0,1) / B
+        db3 = d_z3.sum(dim=(0,2,3)) / B
+        d_p1 = F.conv_transpose2d(d_z3, self.conv2_weight, padding=1)
 
-        for oc in range(4):
-            grad_conv1_bias[oc] = grad_conv1[0, oc].sum()
-            grad_conv1_weight[oc, 0] = F.conv2d(
-                self.x,
-                grad_conv1[:, oc:oc+1]
-            ).squeeze()
+        # Block 1 Back
+        d_a2 = F.max_unpool2d(d_p1, self.idx1, 2, output_size=self.a2.shape)
+        d_z2 = d_a2 * (self.z2 > 0).float()
+        dw2 = F.conv2d(self.a1.transpose(0,1), d_z2.transpose(0,1), padding=1).transpose(0,1) / B
+        db2 = d_z2.sum(dim=(0,2,3)) / B
+        d_a1 = F.conv_transpose2d(d_z2, self.c2_w, padding=1)
 
-        # --------------------------------------------------------
-        # SGD update
-        # --------------------------------------------------------
-        self.fc_weight.data -= lr * grad_fc_weight
-        self.fc_bias.data -= lr * grad_fc_bias
+        d_z1 = d_a1 * (self.z1 > 0).float()
+        dw1 = F.conv2d(self.x.transpose(0,1), d_z1.transpose(0,1), padding=1).transpose(0,1) / B
+        db1 = d_z1.sum(dim=(0,2,3)) / B
 
-        self.conv2_weight.data -= lr * grad_conv2_weight
-        self.conv2_bias.data -= lr * grad_conv2_bias
-
-        self.conv1_weight.data -= lr * grad_conv1_weight
-        self.conv1_bias.data -= lr * grad_conv1_bias
+        # 更新权重
+        self.fc_weight -= lr * dw_fc; self.fc_bias -= lr * db_fc
+        self.c6_w -= lr * dw6; self.c6_b -= lr * db6
+        self.c5_w -= lr * dw5; self.c5_b -= lr * db5
+        self.c4_w -= lr * dw4; self.c4_b -= lr * db4
+        self.conv2_weight -= lr * dw3; self.conv2_bias -= lr * db3
+        self.c2_w -= lr * dw2; self.c2_b -= lr * db2
+        self.conv1_weight -= lr * dw1; self.conv1_bias -= lr * db1
